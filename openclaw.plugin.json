@@ -1,0 +1,24 @@
+{
+  "id": "goal-command",
+  "name": "Goal Command",
+  "description": "Adds a closed-loop /goal command that forces execution to DONE, BLOCKED, or FAILED instead of stopping at planning.",
+  "activation": {
+    "onStartup": true
+  },
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": true,
+    "properties": {
+      "goalCommand": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "obsidianRoot": {
+            "type": "string",
+            "description": "Optional absolute path or workspace-relative subdirectory for Obsidian/OpenClaw goal notes. Defaults to <agent-workspace>/OpenClaw."
+          }
+        }
+      }
+    }
+  }
+}
