@@ -367,7 +367,7 @@ Forbidden final states:
 }
 
 export default definePluginEntry({
-  id: "goal-command",
+  id: "openclaw-goal-command",
   name: "Goal Command",
   description: "Closed-loop /goal command for persistent Goal Mode runs.",
   register(api) {

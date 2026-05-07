@@ -1,5 +1,5 @@
 {
-  "id": "goal-command",
+  "id": "openclaw-goal-command",
   "name": "Goal Command",
   "description": "Adds a closed-loop /goal command that forces execution to DONE, BLOCKED, or FAILED instead of stopping at planning.",
   "activation": {
