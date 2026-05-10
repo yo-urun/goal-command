@@ -373,10 +373,10 @@ export default definePluginEntry({
   register(api) {
     api.registerCommand({
       name: "goal",
+      nativeNames: { telegram: "goalmenu" },
       description: "Start or inspect a closed-loop goal run.",
       acceptsArgs: true,
       requireAuth: true,
-      nativeProgressMessages: { default: "Starting Goal Mode..." },
       agentPromptGuidance: [
         "When /goal is invoked and continues to the agent, run a closed-loop objective until DONE, BLOCKED, or FAILED. Use the run directory and update its status files. EXECUTION_READY means execute now, not explain or define. Do not end on an open loop or ask whether to continue unless status.md is BLOCKED with the exact missing input.",
       ],
