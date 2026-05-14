@@ -1,6 +1,6 @@
 {
   "name": "openclaw-goal-command",
-  "version": "0.2.4",
+  "version": "0.2.5",
   "type": "module",
   "description": "Persistent closed-loop /goal command for OpenClaw: creates run files and forces execution to DONE, BLOCKED, or FAILED.",
   "main": "./index.js",
