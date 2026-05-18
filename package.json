@@ -4,6 +4,13 @@
   "type": "module",
   "description": "Closed-loop /goal command with judge model, triple budget tracking, subgoals, completion audit, and Obsidian sync. Synthesizes Hermes, Claude-Goal, Codex, and brasco05.",
   "main": "./index.js",
+  "author": "yo-urun",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/yo-urun/goal-command"
+  },
+  "keywords": ["openclaw", "openclaw-plugin", "goal", "agent", "autonomous", "closed-loop"],
   "scripts": {
     "test": "node tests/classify.test.mjs && node tests/judge.test.mjs && node tests/budget.test.mjs"
   },
