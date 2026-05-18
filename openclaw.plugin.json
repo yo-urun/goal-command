@@ -8,6 +8,9 @@
   "hooks": {
     "allowConversationAccess": true
   },
+  "llm": {
+    "allowModelOverride": true
+  },
   "configSchema": {
     "type": "object",
     "additionalProperties": true,

@@ -8,7 +8,6 @@
 
 import { definePluginEntry } from 'openclaw/plugin-sdk/plugin-entry';
 import path from 'node:path';
-import { readFile } from 'node:fs/promises';
 
 import { isLikelyAbstractGoal } from './lib/classify.js';
 import { callJudge, shouldAutoPause } from './lib/judge.js';
@@ -100,6 +99,9 @@ export default definePluginEntry({
         const goalText = goalRun.goal;
         const lastResponse = event.finalMessage || '';
         const goalConfig = ctx.config?.goalCommand || {};
+
+        // Inject LLM runtime for judge calls
+        goalConfig._llmRuntime = api.runtime.llm;
 
         const judgeResult = await callJudge(goalText, lastResponse, goalRun.subgoals, goalConfig);
 
