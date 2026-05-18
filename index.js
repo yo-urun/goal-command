@@ -155,7 +155,7 @@ export default definePluginEntry({
         // Fail-open: judge errors should not crash the agent loop
         console.error('[goal-command] agent_end hook error:', err);
       }
-    });
+    }, { name: 'goal-judge-eval' });
 
     api.registerCommand({
       name: 'goal',
