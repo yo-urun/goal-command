@@ -1,11 +1,11 @@
 {
   "name": "openclaw-goal-command",
-  "version": "0.2.5",
+  "version": "1.0.0",
   "type": "module",
-  "description": "Persistent closed-loop /goal command for OpenClaw: creates run files and forces execution to DONE, BLOCKED, or FAILED.",
+  "description": "Closed-loop /goal command with judge model, triple budget tracking, subgoals, completion audit, and Obsidian sync. Synthesizes Hermes, Claude-Goal, Codex, and brasco05.",
   "main": "./index.js",
   "scripts": {
-    "test": "node tests/closed-loop.test.mjs"
+    "test": "node tests/classify.test.mjs && node tests/judge.test.mjs && node tests/budget.test.mjs"
   },
   "peerDependencies": {
     "openclaw": ">=2026.3.24-beta.2"

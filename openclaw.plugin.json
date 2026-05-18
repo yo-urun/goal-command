@@ -1,9 +1,12 @@
 {
   "id": "openclaw-goal-command",
   "name": "Goal Command",
-  "description": "Adds a closed-loop /goal command that forces execution to DONE, BLOCKED, or FAILED instead of stopping at planning.",
+  "description": "Closed-loop /goal command with judge model, budget tracking, subgoals, and Obsidian sync. Synthesizes Hermes (judge + subgoals), Claude-Goal (completion audit + wall-clock), Codex (token budget), and brasco05 (classification + Obsidian).",
   "activation": {
     "onStartup": true
+  },
+  "hooks": {
+    "allowConversationAccess": true
   },
   "configSchema": {
     "type": "object",
@@ -13,9 +16,54 @@
         "type": "object",
         "additionalProperties": false,
         "properties": {
+          "maxTurns": {
+            "type": "number",
+            "description": "Maximum continuation turns before BUDGET_LIMITED. Default: 20.",
+            "default": 20
+          },
+          "judgeModel": {
+            "type": "string",
+            "description": "Judge model override (defaults to session model). Example: 'google/gemini-3-flash-preview'."
+          },
+          "judgeTimeout": {
+            "type": "number",
+            "description": "Judge API timeout in seconds. Default: 30.",
+            "default": 30
+          },
+          "judgeMaxTokens": {
+            "type": "number",
+            "description": "Judge max output tokens. Reasoning models need more. Default: 4096.",
+            "default": 4096
+          },
+          "maxConsecutiveParseFailures": {
+            "type": "number",
+            "description": "Consecutive judge parse failures before auto-pause. Default: 3.",
+            "default": 3
+          },
+          "defaultTokenBudget": {
+            "type": "number",
+            "description": "Default token budget (0 = unlimited). Default: 0.",
+            "default": 0
+          },
+          "defaultTimeBudget": {
+            "type": "number",
+            "description": "Default wall-clock budget in seconds (0 = unlimited). Default: 0.",
+            "default": 0
+          },
           "obsidianRoot": {
             "type": "string",
-            "description": "Optional absolute path or workspace-relative subdirectory for Obsidian/OpenClaw goal notes. Defaults to <agent-workspace>/OpenClaw."
+            "description": "Obsidian sync root directory (relative to workspace or absolute). Default: 'OpenClaw'.",
+            "default": "OpenClaw"
+          },
+          "obsidianSync": {
+            "type": "boolean",
+            "description": "Enable Obsidian sync. Default: true.",
+            "default": true
+          },
+          "classificationLang": {
+            "type": "string",
+            "description": "Language for classification heuristics ('auto', 'en', 'de', 'ru'). 'auto' detects from goal text. Default: 'auto'.",
+            "default": "auto"
           }
         }
       }

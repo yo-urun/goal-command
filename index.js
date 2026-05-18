@@ -1,461 +1,451 @@
-import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";
-import { mkdir, readFile, readdir, writeFile } from "node:fs/promises";
-import path from "node:path";
+/**
+ * OpenClaw Goal Command Plugin — main entry point.
+ *
+ * Registers the /goal command and routes subcommands to lib/ modules.
+ *
+ * @module openclaw-goal-command
+ */
 
-const DEFAULT_OBSIDIAN_SUBDIR = "OpenClaw";
+import { definePluginEntry } from 'openclaw/plugin-sdk/plugin-entry';
+import path from 'node:path';
+import { readFile } from 'node:fs/promises';
 
-function nowStamp() {
-  return new Date().toISOString().replace(/[:.]/g, "-");
-}
+import { isLikelyAbstractGoal } from './lib/classify.js';
+import { callJudge, shouldAutoPause } from './lib/judge.js';
+import { BudgetTracker } from './lib/budget.js';
+import {
+  GOAL_STATES,
+  createRun,
+  loadGoalRun,
+  latestRunDir,
+  getRunsBaseDir,
+  readOptional,
+  GoalRun,
+} from './lib/state.js';
+import {
+  renderGoalLoopPrompt,
+  renderSpecCoachPrompt,
+  renderContinuationPrompt,
+  renderResumePrompt,
+} from './lib/prompts.js';
+import { syncRunToObsidian } from './lib/obsidian.js';
 
-function slugify(input) {
-  return String(input || "goal")
-    .toLowerCase()
-    .replace(/[^a-z0-9äöüß]+/gi, "-")
-    .replace(/^-+|-+$/g, "")
-    .slice(0, 64) || "goal";
-}
-
+/**
+ * Resolve the agent workspace directory from the API and config.
+ * @param {Object} api - OpenClaw plugin API
+ * @param {Object} cfg - Plugin config
+ * @returns {string}
+ */
 function workspaceDir(api, cfg) {
   return api.runtime.agent.resolveAgentWorkspaceDir(cfg);
 }
 
-function obsidianRoot(api, ctx) {
-  const configured = ctx.config?.goalCommand?.obsidianRoot;
-  if (configured && path.isAbsolute(configured)) return configured;
-  const root = workspaceDir(api, ctx.config);
-  return path.join(root, configured || DEFAULT_OBSIDIAN_SUBDIR);
+/**
+ * Get the plugin config section for goalCommand.
+ * @param {Object} ctx - Command context
+ * @returns {Object}
+ */
+function getGoalConfig(ctx) {
+  return ctx.config?.goalCommand || {};
 }
 
-function isLikelyAbstractGoal(goal) {
-  const normalized = goal.trim().toLowerCase();
-  const words = normalized.split(/\s+/).filter(Boolean);
-  const abstractTerms = [
-    "besser",
-    "verbessern",
-    "optimieren",
-    "überarbeiten",
-    "konzept",
-    "system",
-    "app",
-    "plattform",
-    "irgendwas",
-    "schöner",
-    "modern",
-    "perfekt",
-    "fertig",
-  ];
-  const concreteTerms = [
-    "baue",
-    "erstelle",
-    "fixe",
-    "behebe",
-    "lege",
-    "validiere",
-    "teste",
-    "implementiere",
-    "datei",
-    "endpoint",
-    "button",
-    "seite",
-    "funktion",
-    "wenn",
-    "fertig wenn",
-  ];
-
-  const hasAbstractTerm = abstractTerms.some((term) => normalized.includes(term));
-  const hasConcreteTerm = concreteTerms.some((term) => normalized.includes(term));
-  const hasValidationHint = /\b(test|validier|prüf|fertig wenn|done wenn|akzeptanz|erfolg)\b/i.test(goal);
-
-  if (words.length <= 3) return true;
-  if (hasAbstractTerm && !hasConcreteTerm) return true;
-  if (words.length <= 7 && hasAbstractTerm && !hasValidationHint) return true;
-  return false;
-}
-
-async function latestRunDir(baseDir) {
-  try {
-    const entries = await readdir(baseDir, { withFileTypes: true });
-    const dirs = entries.filter((entry) => entry.isDirectory()).map((entry) => entry.name).sort();
-    const latest = dirs.at(-1);
-    return latest ? path.join(baseDir, latest) : null;
-  } catch {
-    return null;
-  }
-}
-
-async function createRun(api, ctx, goal, mode) {
-  const root = workspaceDir(api, ctx.config);
-  const runId = `${nowStamp()}-${slugify(goal)}`;
-  const runDir = path.join(root, "goals", "runs", runId);
-  const state = mode === "spec" ? "NEEDS_SPEC" : "EXECUTION_READY";
-  const createdAt = new Date().toISOString();
-  await mkdir(runDir, { recursive: true });
-
-  const files = {
-    "goal.md": `# Goal\n\n${goal}\n\n## Contract\n- End states allowed: DONE, BLOCKED, FAILED.\n- EXECUTION_READY is not a final state. It means execute now.\n- Do not report DONE until Definition of Done is validated with concrete evidence.\n- Do not stop after creating a plan. Continue with tool execution unless blocked.\n- If the goal is underspecified, ask only the minimum blocking questions and keep status NEEDS_SPEC/BLOCKED.\n`,
-    "status.md": `# Status\n\n- state: ${state}\n- mode: ${mode}\n- runId: ${runId}\n- project: TBD\n- createdAt: ${createdAt}\n- channel: ${ctx.channel}\n- sessionKey: ${ctx.sessionKey || "unknown"}\n- nextAction: ${state === "EXECUTION_READY" ? "execute-now" : "ask-blocking-spec-questions"}\n`, 
-    "decision_log.md": `# Decision Log\n\n- ${createdAt}: Goal command created this run.\n- ${createdAt}: Initial classification: ${mode === "spec" ? "abstract/needs spec-coach" : "concrete/execution-ready"}.\n`,
-    "validation.md": `# Validation\n\nPending. Goal is not DONE until this file contains concrete validation evidence.\n`,
-    "feature_spec.md": mode === "spec"
-      ? `# Feature Spec\n\n## Raw Goal\n${goal}\n\n## Status\nNEEDS_SPEC — answer the blocking Spec-Coach questions before implementation.\n\n## Open Questions\nPending.\n`
-      : `# Feature Spec\n\nPending. The orchestrator must create or refine this before implementation if the goal is non-trivial.\n`,
-    "plan.md": `# Plan\n\nPending. The orchestrator must create this before execution if the goal is non-trivial.\n`,
-  };
-
-  await Promise.all(Object.entries(files).map(([name, content]) => writeFile(path.join(runDir, name), content, "utf8")));
-  return { runId, runDir, state };
-}
-
-async function readOptional(file) {
-  try {
-    return await readFile(file, "utf8");
-  } catch {
-    return "";
-  }
-}
-
-async function readStatusState(runDir) {
-  const status = await readOptional(path.join(runDir, "status.md"));
-  const match = status.match(/- state:\s*([^\n]+)/i);
-  return match?.[1]?.trim() || "UNKNOWN";
-}
-
-function stripTitle(markdown) {
-  return markdown.replace(/^#\s+[^\n]+\n*/u, "").trim();
-}
-
-function firstMeaningfulLine(markdown, fallback = "Noch nicht gepflegt.") {
-  const line = stripTitle(markdown)
-    .split("\n")
-    .map((item) => item.trim())
-    .find((item) => item && !item.startsWith("##") && !item.toLowerCase().startsWith("pending"));
-  return line || fallback;
-}
-
-function markerStart(name) {
-  return `<!-- OPENCLAW:${name}:START -->`;
-}
-
-function markerEnd(name) {
-  return `<!-- OPENCLAW:${name}:END -->`;
-}
-
-function replaceAutoSection(content, name, body) {
-  const start = markerStart(name);
-  const end = markerEnd(name);
-  const section = `${start}\n${body.trim()}\n${end}`;
-  if (content.includes(start) && content.includes(end)) {
-    const pattern = new RegExp(`${escapeRegExp(start)}[\\s\\S]*?${escapeRegExp(end)}`, "m");
-    return content.replace(pattern, section);
-  }
-  return `${content.trim()}\n\n${section}\n`;
-}
-
-function escapeRegExp(input) {
-  return input.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
-
-function uniqueLines(lines) {
-  const seen = new Set();
-  return lines.filter((line) => {
-    const normalized = line.trim();
-    if (!normalized || seen.has(normalized)) return false;
-    seen.add(normalized);
-    return true;
-  });
-}
-
-function existingAutoLines(content, name) {
-  const start = markerStart(name);
-  const end = markerEnd(name);
-  const startIndex = content.indexOf(start);
-  const endIndex = content.indexOf(end);
-  if (startIndex === -1 || endIndex === -1 || endIndex <= startIndex) return [];
-  return content.slice(startIndex + start.length, endIndex).split("\n").map((line) => line.trim()).filter(Boolean);
-}
-
-function detectProject(run) {
-  const combined = `${run.status}\n${run.goal}\n${run.spec}\n${run.plan}`;
-  const explicit = combined.match(/(?:project|projekt):\s*([^\n]+)/i)?.[1]?.trim();
-  if (explicit && !/^tbd$/i.test(explicit)) return cleanProjectName(explicit);
-
-  const knownProjects = [
-    "Caresys",
-    "AI-Accountant",
-    "MindGraph",
-    "Analytics Rocket",
-    "MarketingApp",
-    "Hermes Agent",
-    "OpenClaw",
-    "CloudRift NemoClaw",
-  ];
-  const match = knownProjects.find((project) => combined.toLowerCase().includes(project.toLowerCase()));
-  return match || "Inbox";
-}
-
-function cleanProjectName(input) {
-  return String(input)
-    .replace(/[#[\]*/`|]/g, "")
-    .replace(/\s+/g, " ")
-    .trim()
-    .slice(0, 80) || "Inbox";
-}
-
-function extractListItems(markdown, matcher) {
-  return markdown
-    .split("\n")
-    .map((line) => line.trim())
-    .filter((line) => /^[-*]\s+/.test(line) && matcher.test(line))
-    .map((line) => line.replace(/^[-*]\s+/, "- "));
-}
-
-function wikiLink(pathWithoutExtension, label) {
-  return `[[${pathWithoutExtension}|${label}]]`;
-}
-
-async function ensureObsidianStructure(root) {
-  await Promise.all([
-    mkdir(root, { recursive: true }),
-    mkdir(path.join(root, "Projects"), { recursive: true }),
-    mkdir(path.join(root, "Goals"), { recursive: true }),
-    mkdir(path.join(root, "Archive"), { recursive: true }),
-  ]);
-
-  const defaults = {
-    "OpenClaw.md": "# OpenClaw\n\nDashboard für Agenten-Kontext, Projekte, Goals und Learnings.\n\n- [[Projects]]\n- [[Goals]]\n- [[Learnings]]\n- [[Decisions]]\n",
-    "Projects.md": "# Projects\n\nProjektübersicht. Projektseiten sind die Source of Truth.\n",
-    "Goals.md": "# Goals\n\nAktive und abgeschlossene Goal-Runs.\n",
-    "Learnings.md": "# Learnings\n\nNur langfristig relevante, kuratierte Learnings.\n",
-    "Decisions.md": "# Decisions\n\nWichtige Entscheidungen mit Projektbezug.\n",
-  };
-
-  await Promise.all(Object.entries(defaults).map(async ([name, content]) => {
-    const file = path.join(root, name);
-    const existing = await readOptional(file);
-    if (!existing) await writeFile(file, content, "utf8");
-  }));
-}
-
-async function loadRun(runDir) {
-  const status = await readOptional(path.join(runDir, "status.md"));
-  const runId = status.match(/- runId:\s*([^\n]+)/i)?.[1]?.trim() || path.basename(runDir);
+/**
+ * Parse `--turns N` and `--tokens N` flags from a string.
+ * @param {string} text
+ * @returns {{ turns: number|null, tokens: number|null }}
+ */
+function parseBudgetFlags(text) {
+  const turnsMatch = text.match(/--turns\s+(\d+)/);
+  const tokensMatch = text.match(/--tokens\s+(\d+)/);
   return {
-    runDir,
-    runId,
-    goal: await readOptional(path.join(runDir, "goal.md")),
-    status,
-    spec: await readOptional(path.join(runDir, "feature_spec.md")),
-    plan: await readOptional(path.join(runDir, "plan.md")),
-    validation: await readOptional(path.join(runDir, "validation.md")),
-    decisions: await readOptional(path.join(runDir, "decision_log.md")),
+    turns: turnsMatch ? parseInt(turnsMatch[1], 10) : null,
+    tokens: tokensMatch ? parseInt(tokensMatch[1], 10) : null,
   };
-}
-
-async function syncRunToObsidian(ctx, runDir) {
-  const root = obsidianRoot(api, ctx);
-  await ensureObsidianStructure(root);
-
-  const run = await loadRun(runDir);
-  const project = detectProject(run);
-  const date = run.runId.match(/^\d{4}-\d{2}-\d{2}/)?.[0] || new Date().toISOString().slice(0, 10);
-  const state = run.status.match(/- state:\s*([^\n]+)/i)?.[1]?.trim() || "UNKNOWN";
-  const goalTitle = firstMeaningfulLine(run.goal, run.runId).replace(/^#\s*Goal\s*/i, "").trim() || run.runId;
-  const goalSlug = `${date}-${slugify(`${project}-${goalTitle}`)}`;
-  const goalNoteName = `${goalSlug}.md`;
-  const projectFileName = `${cleanProjectName(project)}.md`;
-  const projectPath = path.join(root, "Projects", projectFileName);
-  const goalPath = path.join(root, "Goals", goalNoteName);
-  const projectLink = wikiLink(`Projects/${projectFileName.replace(/\.md$/u, "")}`, project);
-  const goalLink = wikiLink(`Goals/${goalNoteName.replace(/\.md$/u, "")}`, goalTitle.slice(0, 80));
-  const syncedAt = new Date().toISOString();
-
-  const goalNote = `# ${goalTitle}\n\n- Projekt: ${projectLink}\n- Status: ${state}\n- RunId: ${run.runId}\n- RunDir: \`${run.runDir}\`\n- Sync: ${syncedAt}\n\n## Ziel\n${stripTitle(run.goal) || "Nicht dokumentiert."}\n\n## Spezifikation\n${stripTitle(run.spec) || "Nicht dokumentiert."}\n\n## Plan / Verlauf\n${stripTitle(run.plan) || "Nicht dokumentiert."}\n\n## Validierung\n${stripTitle(run.validation) || "Keine Validierung dokumentiert."}\n\n## Entscheidungen\n${stripTitle(run.decisions) || "Keine Entscheidungen dokumentiert."}\n`;
-  await writeFile(goalPath, goalNote, "utf8");
-
-  const existingProject = await readOptional(projectPath) || `# ${project}\n\nSource of Truth für ${project}. Manuelle Notizen bleiben außerhalb der OpenClaw-Auto-Sektionen erhalten.\n`;
-  const recentGoals = uniqueLines([
-    `- ${date}: ${goalLink} — ${state}`,
-    ...existingAutoLines(existingProject, "recent-goals"),
-  ]).slice(0, 20);
-  const projectCurrent = [
-    `Letztes Update: ${date}`,
-    `Status: ${state}`,
-    `Letztes Goal: ${goalLink}`,
-    `Kurzkontext: ${firstMeaningfulLine(run.validation, firstMeaningfulLine(run.spec, goalTitle))}`,
-  ].join("\n");
-  let projectContent = replaceAutoSection(existingProject, "current-status", projectCurrent);
-  projectContent = replaceAutoSection(projectContent, "recent-goals", recentGoals.join("\n"));
-  await writeFile(projectPath, projectContent, "utf8");
-
-  const projectsIndex = await readOptional(path.join(root, "Projects.md"));
-  const projectRows = uniqueLines([
-    `- ${projectLink} — zuletzt ${date}, ${state}`,
-    ...existingAutoLines(projectsIndex, "project-index").filter((line) => !line.includes(`[[Projects/${projectFileName.replace(/\.md$/u, "")}|`)),
-  ]).sort((a, b) => a.localeCompare(b));
-  await writeFile(path.join(root, "Projects.md"), replaceAutoSection(projectsIndex, "project-index", projectRows.join("\n")), "utf8");
-
-  const goalsIndex = await readOptional(path.join(root, "Goals.md"));
-  const goalRows = uniqueLines([
-    `- ${date}: ${goalLink} — ${projectLink} — ${state}`,
-    ...existingAutoLines(goalsIndex, "goal-index"),
-  ]).slice(0, 100);
-  await writeFile(path.join(root, "Goals.md"), replaceAutoSection(goalsIndex, "goal-index", goalRows.join("\n")), "utf8");
-
-  const dashboard = await readOptional(path.join(root, "OpenClaw.md"));
-  const dashboardBody = [`- Letzter Sync: ${syncedAt}`, `- Letztes Projekt: ${projectLink}`, `- Letztes Goal: ${goalLink}`].join("\n");
-  await writeFile(path.join(root, "OpenClaw.md"), replaceAutoSection(dashboard, "dashboard", dashboardBody), "utf8");
-
-  const learningItems = extractListItems(`${run.spec}\n${run.validation}\n${run.decisions}`, /learning|lernen|erkenntnis|fallstrick|solution memory/i);
-  if (learningItems.length > 0) {
-    const learnings = await readOptional(path.join(root, "Learnings.md"));
-    const rows = uniqueLines([
-      ...learningItems.map((item) => `${item} (${projectLink}, ${date})`),
-      ...existingAutoLines(learnings, "learning-index"),
-    ]).slice(0, 100);
-    await writeFile(path.join(root, "Learnings.md"), replaceAutoSection(learnings, "learning-index", rows.join("\n")), "utf8");
-  }
-
-  const decisionItems = extractListItems(run.decisions, /decision|entscheidung|entschied|beschlossen/i);
-  if (decisionItems.length > 0) {
-    const decisions = await readOptional(path.join(root, "Decisions.md"));
-    const rows = uniqueLines([
-      ...decisionItems.map((item) => `${item} (${projectLink}, ${date})`),
-      ...existingAutoLines(decisions, "decision-index"),
-    ]).slice(0, 100);
-    await writeFile(path.join(root, "Decisions.md"), replaceAutoSection(decisions, "decision-index", rows.join("\n")), "utf8");
-  }
-
-  return { root, project, projectPath, goalPath, state };
-}
-
-function specCoachPrompt(goal, runDir) {
-  return `Spec-Coach Mode activated for an abstract /goal. Do not implement yet.\n\nRaw goal: ${goal}\nRun directory: ${runDir}\n\nProtocol:\n1. Read/update feature_spec.md and status.md.\n2. Ask 3-5 strict blocking questions that turn the goal into a buildable spec.\n3. Questions must cover: exact outcome, target project/surface, Definition of Done, constraints/out-of-scope, validation method.\n4. Do not start coding, subagents, shell commands for implementation, or external actions.\n5. Update status.md with state: NEEDS_SPEC or BLOCKED and write the questions into feature_spec.md.\n6. End by asking the user for the missing answers.\n\nThe goal is to prevent open-loop work by forcing a clear spec before execution.`;
-}
-
-function goalLoopPrompt(goal, runDir) {
-  return `Goal Mode activated. Treat this as a closed-loop objective, not a normal chat request.
-
-CRITICAL EXECUTION CONTRACT:
-- Do not answer with only a definition, explanation, checklist, or plan.
-- Do not stop while status.md says EXECUTION_READY.
-- EXECUTION_READY means: start executing now, using tools/subagents as needed.
-- Your turn is incomplete until status.md is updated to exactly one terminal state: DONE, BLOCKED, or FAILED.
-- If you need to ask the user a blocking question, mark status.md as BLOCKED first and write the blocker into validation.md.
-- If validation fails after bounded debugging, mark status.md as FAILED and write the evidence.
-- Only mark DONE after the Definition of Done is validated with concrete evidence.
-
-Goal: ${goal}
-Run directory: ${runDir}
-
-Protocol:
-1. Read the run files first: goal.md, status.md, feature_spec.md, plan.md, validation.md, decision_log.md.
-2. Establish a Goal Contract and Definition of Done. If critical info is missing, ask the minimum blocking question and mark the run BLOCKED in status.md before replying.
-3. For non-trivial work, create/update feature_spec.md and plan.md in the run directory before implementation.
-4. Execute the work in the same turn whenever safely possible. Use tools/subagents instead of merely describing what should happen.
-5. Validate with concrete evidence before DONE: test/build/lint/status/diff/screenshot/log inspection, or a named external blocker.
-6. If validation fails, debug in a bounded loop. Do not restart from vague planning; record each failed attempt in decision_log.md.
-7. Before DONE, synchronize project context to Obsidian structure OpenClaw/: update the project Source-of-Truth page, create a Goal detail note, update Projects.md and Goals.md, and only add durable learnings/decisions when relevant. If the plugin command is available, use /goal sync for this run; otherwise update those markdown files directly.
-8. Update status.md, validation.md, decision_log.md, and Obsidian context before final response.
-9. Final response must include: terminal state, validation evidence, files changed, and remaining blockers if any.
-
-Forbidden final states:
-- "I created the plan" while status is EXECUTION_READY.
-- "Ready to execute" without tool execution.
-- "Let me know if you want me to continue" unless status is BLOCKED with the exact missing input.
-- DONE without validation evidence.`;
 }
 
 export default definePluginEntry({
-  id: "openclaw-goal-command",
-  name: "Goal Command",
-  description: "Closed-loop /goal command for persistent Goal Mode runs.",
+  id: 'openclaw-goal-command',
+  name: 'Goal Command',
+  description: 'Closed-loop /goal command with judge model, budget tracking, subgoals, and Obsidian sync.',
   register(api) {
+    // ── agent_end hook: judge evaluation after every agent turn ──
+    api.registerHook(['agent_end'], async (event, ctx) => {
+      try {
+        const wsDir = api.runtime.agent.resolveAgentWorkspaceDir(ctx.config);
+        const baseDir = getRunsBaseDir(wsDir);
+        const dir = await latestRunDir(baseDir);
+        if (!dir) return; // no active goal
+
+        const statusContent = await readOptional(path.join(dir, 'status.md'));
+        if (!statusContent) return;
+
+        const goalRun = await loadGoalRun(dir);
+
+        // Only evaluate for active (non-terminal) goals
+        if (goalRun.isTerminal()) return;
+        if (goalRun.state !== 'ACTIVE') return;
+
+        const budget = BudgetTracker.fromStatusFields(goalRun.budgetFields);
+
+        // Check budget exhaustion
+        budget.incrementTurn();
+        if (budget.isExhausted()) {
+          goalRun.state = 'BUDGET_LIMITED';
+          budget.stopActiveClock();
+          await goalRun.writeStatus(budget.toStatusFields());
+          return;
+        }
+
+        // Call judge
+        const goalText = goalRun.goal;
+        const lastResponse = event.finalMessage || '';
+        const goalConfig = ctx.config?.goalCommand || {};
+
+        const judgeResult = await callJudge(goalText, lastResponse, goalRun.subgoals, goalConfig);
+
+        // Track parse failures
+        const newFailures = judgeResult.parse_failed
+          ? (goalRun.judgeFields.consecutive_parse_failures || 0) + 1
+          : 0;
+        goalRun.judgeFields = {
+          last_verdict: judgeResult.verdict,
+          last_reason: judgeResult.reason,
+          consecutive_parse_failures: newFailures,
+        };
+
+        // Auto-pause on consecutive parse failures
+        if (shouldAutoPause(newFailures, goalConfig.maxConsecutiveParseFailures || 3)) {
+          goalRun.state = 'PAUSED';
+          budget.stopActiveClock();
+          await goalRun.writeStatus(budget.toStatusFields());
+          return;
+        }
+
+        // Judge says DONE
+        if (judgeResult.verdict === 'done') {
+          goalRun.state = 'DONE';
+          budget.stopActiveClock();
+          await goalRun.writeStatus(budget.toStatusFields());
+          await goalRun.writeValidation(goalText, judgeResult.reason, true);
+          return;
+        }
+
+        // Judge says CONTINUE — inject continuation prompt for next turn
+        const prompt = renderContinuationPrompt(
+          goalText,
+          judgeResult.reason,
+          goalRun.subgoals,
+          { display: budget.getDisplay() },
+        );
+
+        await goalRun.writeStatus(budget.toStatusFields());
+
+        if (ctx.sessionKey) {
+          await api.enqueueNextTurnInjection({
+            sessionKey: ctx.sessionKey,
+            placement: 'prepend_context',
+            ttlMs: 10 * 60 * 1000,
+            idempotencyKey: `goal-continue:${goalRun.runId}:${Date.now()}`,
+            text: prompt,
+          });
+        }
+      } catch (err) {
+        // Fail-open: judge errors should not crash the agent loop
+        console.error('[goal-command] agent_end hook error:', err);
+      }
+    });
+
     api.registerCommand({
-      name: "goal",
-      nativeNames: { telegram: "goalmenu" },
-      description: "Start or inspect a closed-loop goal run.",
+      name: 'goal',
+      nativeNames: { telegram: 'goalmenu' },
+      description: 'Start or manage a closed-loop goal run.',
       acceptsArgs: true,
       requireAuth: true,
       agentPromptGuidance: [
-        "When /goal is invoked and continues to the agent, run a closed-loop objective until DONE, BLOCKED, or FAILED. Use the run directory and update its status files. EXECUTION_READY means execute now, not explain or define. Do not end on an open loop or ask whether to continue unless status.md is BLOCKED with the exact missing input.",
+        'When /goal is invoked and continues to the agent, run a closed-loop objective until DONE, BLOCKED, or FAILED. Use the run directory and update its status files. ACTIVE means execute now, not explain or define. Do not end on an open loop or ask whether to continue unless status.md is BLOCKED with the exact missing input.',
       ],
       handler: async (ctx) => {
-        const args = (ctx.args || "").trim();
-        const baseDir = path.join(workspaceDir(api, ctx.config), "goals", "runs");
+        const args = (ctx.args || '').trim();
+        const goalConfig = getGoalConfig(ctx);
+        const wsDir = workspaceDir(api, ctx.config);
+        const baseDir = getRunsBaseDir(wsDir);
 
-        if (!args || args === "help") {
+        // ── Help / no args ───────────────────────────────────────
+        if (!args || args === 'help') {
           return {
-            text: "Usage: /goal <ziel>\n/goal status [runId]\n/goal resume [runId]\n/goal sync [runId]\n/goal cancel is planned for v2.",
+            text: [
+              'Usage:',
+              '/goal <objective> — Start a new goal',
+              '/goal status [runId] — Show current goal state',
+              '/goal pause — Pause the goal loop',
+              '/goal resume [--turns N] [--tokens N] — Resume + extend budget',
+              '/goal clear — Drop the goal entirely',
+              '/goal sub <criterion> — Add a subgoal',
+              '/goal sub remove <N> — Remove subgoal by index',
+              '/goal sub clear — Remove all subgoals',
+              '/goal budget [--turns N] [--tokens N] — View/modify budget',
+              '/goal sync [runId] — Sync to Obsidian project notes',
+            ].join('\n'),
           };
         }
 
         const [action, ...rest] = args.split(/\s+/);
         const normalizedAction = action.toLowerCase();
 
-        if (normalizedAction === "status") {
-          const requested = rest.join(" ").trim();
-          const dir = requested ? path.join(baseDir, requested) : await latestRunDir(baseDir);
-          if (!dir) return { text: "No goal runs found yet." };
+        // ── /goal status [runId] ─────────────────────────────────
+        if (normalizedAction === 'status') {
+          const requested = rest.join(' ').trim();
+          const dir = requested
+            ? path.join(baseDir, requested)
+            : await latestRunDir(baseDir);
+          if (!dir) return { text: 'No goal runs found yet.' };
           try {
-            const status = await readFile(path.join(dir, "status.md"), "utf8");
-            return { text: status.slice(0, 3500) };
+            const status = await readOptional(path.join(dir, 'status.md'));
+            if (!status) return { text: `Run found but status.md is empty: ${dir}` };
+
+            // Also load budget display if possible
+            const goalRun = await loadGoalRun(dir);
+            const budget = new BudgetTracker(goalRun.budgetFields);
+            const budgetDisplay = budget.getDisplay();
+
+            return {
+              text: `${status.slice(0, 3000)}\n\nBudget display: ${budgetDisplay}`,
+            };
           } catch {
             return { text: `Goal run found but status.md could not be read: ${dir}` };
           }
         }
 
-        if (normalizedAction === "resume") {
-          const requested = rest.join(" ").trim();
-          const dir = requested ? path.join(baseDir, requested) : await latestRunDir(baseDir);
-          if (!dir) return { text: "No goal run to resume." };
-          const state = await readStatusState(dir);
+        // ── /goal pause ─────────────────────────────────────────
+        if (normalizedAction === 'pause') {
+          const dir = await latestRunDir(baseDir);
+          if (!dir) return { text: 'No active goal to pause.' };
+
+          const goalRun = await loadGoalRun(dir);
+          if (goalRun.isTerminal()) {
+            return { text: `Goal is already in terminal state: ${goalRun.state}` };
+          }
+          if (goalRun.state === 'PAUSED') {
+            return { text: 'Goal is already paused.' };
+          }
+
+          // Stop the active clock and update state
+          const budget = BudgetTracker.fromStatusFields(goalRun.budgetFields);
+          budget.stopActiveClock();
+
+          goalRun.state = 'PAUSED';
+          goalRun.pausedAt = new Date().toISOString();
+          await goalRun.writeStatus(budget.toStatusFields());
+
+          return { text: `Goal paused: ${goalRun.runId}\nBudget: ${budget.getDisplay()}` };
+        }
+
+        // ── /goal resume [--turns N] [--tokens N] ───────────────
+        if (normalizedAction === 'resume') {
+          const restText = rest.join(' ');
+          const flags = parseBudgetFlags(restText);
+
+          // Filter out flags to find optional runId
+          const runIdPart = restText.replace(/--\w+\s+\d+/g, '').trim();
+          const dir = runIdPart
+            ? path.join(baseDir, runIdPart)
+            : await latestRunDir(baseDir);
+          if (!dir) return { text: 'No goal run to resume.' };
+
+          const goalRun = await loadGoalRun(dir);
+          if (goalRun.isTerminal()) {
+            return { text: `Cannot resume: goal is in terminal state ${goalRun.state}. Use /goal clear to remove it.` };
+          }
+
+          const budget = BudgetTracker.fromStatusFields(goalRun.budgetFields);
+
+          // Extend budget if requested
+          if (flags.turns) budget.extendTurns(flags.turns);
+          if (flags.tokens) budget.extendTokens(flags.tokens);
+
+          // Transition to ACTIVE
+          const prevState = goalRun.state;
+          goalRun.state = goalRun.mode === 'spec' ? 'SPEC_COACH' : 'ACTIVE';
+          goalRun.resumedAt = new Date().toISOString();
+          budget.startActiveClock();
+
+          await goalRun.writeStatus(budget.toStatusFields());
+
+          // Inject continuation prompt
           if (ctx.sessionKey) {
+            const prompt = renderResumePrompt(
+              goalRun.goal,
+              goalRun.runDir,
+              goalRun.state,
+              { display: budget.getDisplay() }
+            );
             await api.enqueueNextTurnInjection({
               sessionKey: ctx.sessionKey,
-              placement: "prepend_context",
+              placement: 'prepend_context',
               ttlMs: 10 * 60 * 1000,
-              idempotencyKey: `goal-resume:${dir}:${state}`,
-              text: state === "NEEDS_SPEC"
-                ? `Resume Spec-Coach Mode from run directory: ${dir}\nRead status.md and feature_spec.md first. Continue asking/refining until the spec is buildable. Do not implement yet.`
-                : `Resume Goal Mode from run directory: ${dir}\nRead goal.md, status.md, feature_spec.md, plan.md, validation.md, and decision_log.md first. If status is EXECUTION_READY, execute now; do not answer with only a plan or definition. Continue until status.md is DONE, BLOCKED, or FAILED. Before DONE, validate with concrete evidence and sync the run to Obsidian OpenClaw/ project context.`,
+              idempotencyKey: `goal-resume:${goalRun.runId}:${Date.now()}`,
+              text: prompt,
             });
           }
+
           return {
-            text: `Resuming Goal Mode: ${dir}\nState: ${state}`,
+            text: `Goal resumed: ${goalRun.runId}\nState: ${prevState} → ${goalRun.state}\nBudget: ${budget.getDisplay()}`,
             continueAgent: true,
           };
         }
 
-        if (normalizedAction === "sync") {
-          const requested = rest.join(" ").trim();
-          const dir = requested ? path.join(baseDir, requested) : await latestRunDir(baseDir);
-          if (!dir) return { text: "No goal run to sync." };
-          const result = await syncRunToObsidian(ctx, dir);
+        // ── /goal clear ─────────────────────────────────────────
+        if (normalizedAction === 'clear') {
+          const dir = await latestRunDir(baseDir);
+          if (!dir) return { text: 'No goal run to clear.' };
+
+          const goalRun = await loadGoalRun(dir);
+          const budget = BudgetTracker.fromStatusFields(goalRun.budgetFields);
+          budget.stopActiveClock();
+
+          goalRun.state = 'CLEARED';
+          await goalRun.writeStatus(budget.toStatusFields());
+
+          return { text: `Goal cleared: ${goalRun.runId}` };
+        }
+
+        // ── /goal sub <text|remove|clear> ────────────────────────
+        if (normalizedAction === 'sub') {
+          const subArgs = rest.join(' ').trim();
+          const dir = await latestRunDir(baseDir);
+          if (!dir) return { text: 'No goal run. Start one with /goal <objective> first.' };
+
+          const goalRun = await loadGoalRun(dir);
+
+          // /goal sub (no args) — list subgoals
+          if (!subArgs || subArgs === 'list') {
+            if (goalRun.subgoals.length === 0) {
+              return { text: 'No subgoals defined. Use /goal sub <criterion> to add one.' };
+            }
+            const items = goalRun.subgoals.map((s, i) => `${i + 1}. ${s}`).join('\n');
+            return { text: `Subgoals for ${goalRun.runId}:\n${items}` };
+          }
+
+          // /goal sub remove <N>
+          const removeMatch = subArgs.match(/^remove\s+(\d+)/i);
+          if (removeMatch) {
+            const index = parseInt(removeMatch[1], 10);
+            if (!goalRun.removeSubgoal(index)) {
+              return { text: `Invalid subgoal index: ${index}. Valid range: 1-${goalRun.subgoals.length}` };
+            }
+            const budget = BudgetTracker.fromStatusFields(goalRun.budgetFields);
+            await goalRun.writeStatus(budget.toStatusFields());
+            return { text: `Removed subgoal ${index}. Remaining: ${goalRun.subgoals.length}` };
+          }
+
+          // /goal sub clear
+          if (subArgs.toLowerCase() === 'clear') {
+            goalRun.clearSubgoals();
+            const budget = BudgetTracker.fromStatusFields(goalRun.budgetFields);
+            await goalRun.writeStatus(budget.toStatusFields());
+            return { text: 'All subgoals cleared.' };
+          }
+
+          // /goal sub <text> — add subgoal
+          goalRun.addSubgoal(subArgs);
+          const budget = BudgetTracker.fromStatusFields(goalRun.budgetFields);
+          await goalRun.writeStatus(budget.toStatusFields());
           return {
-            text: `Obsidian sync fertig.\nProjekt: ${result.project}\nState: ${result.state}\nProjektseite: ${result.projectPath}\nGoal-Note: ${result.goalPath}`,
+            text: `Subgoal added: ${goalRun.subgoals.length}. ${subArgs}\nAll subgoals must be satisfied for DONE.`,
           };
         }
 
-        if (normalizedAction === "cancel") {
-          return { text: "Cancel is planned for v2. For now use /stop for an active run and mark the goal status manually if needed." };
+        // ── /goal budget [--turns N] [--tokens N] ────────────────
+        if (normalizedAction === 'budget') {
+          const restText = rest.join(' ');
+          const flags = parseBudgetFlags(restText);
+          const dir = await latestRunDir(baseDir);
+          if (!dir) return { text: 'No goal run. Start one with /goal <objective> first.' };
+
+          const goalRun = await loadGoalRun(dir);
+          const budget = BudgetTracker.fromStatusFields(goalRun.budgetFields);
+
+          // Modify budget if flags present
+          let modified = false;
+          if (flags.turns) {
+            budget.extendTurns(flags.turns);
+            modified = true;
+          }
+          if (flags.tokens) {
+            budget.extendTokens(flags.tokens);
+            modified = true;
+          }
+
+          if (modified) {
+            await goalRun.writeStatus(budget.toStatusFields());
+            return {
+              text: `Budget updated: ${budget.getDisplay()}`,
+            };
+          }
+
+          return {
+            text: `Budget: ${budget.getDisplay()}\nState: ${goalRun.state}\nExhausted: ${budget.isExhausted()}`,
+          };
         }
 
+        // ── /goal sync [runId] ────────────────────────────────────
+        if (normalizedAction === 'sync') {
+          const requested = rest.join(' ').trim();
+          const dir = requested
+            ? path.join(baseDir, requested)
+            : await latestRunDir(baseDir);
+          if (!dir) return { text: 'No goal run to sync.' };
+
+          try {
+            const result = await syncRunToObsidian(ctx, dir, wsDir, goalConfig);
+            return {
+              text: `Obsidian sync complete.\nProject: ${result.project}\nState: ${result.state}\nProject page: ${result.projectPath}\nGoal note: ${result.goalPath}`,
+            };
+          } catch (e) {
+            return { text: `Obsidian sync failed: ${e.message}` };
+          }
+        }
+
+        // ── /goal <objective> — Start a new goal ─────────────────
         const goal = args;
-        const mode = isLikelyAbstractGoal(goal) ? "spec" : "execution";
-        const { runId, runDir, state } = await createRun(api, ctx, goal, mode);
+        const isAbstract = isLikelyAbstractGoal(goal);
+        const mode = isAbstract ? 'spec' : 'execution';
+
+        const budgetOpts = {
+          maxTurns: goalConfig.maxTurns ?? 20,
+          tokenBudget: goalConfig.defaultTokenBudget ?? 0,
+          timeBudget: goalConfig.defaultTimeBudget ?? 0,
+        };
+
+        const { runId, runDir, state, goalRun } = await createRun(
+          wsDir, goal, mode, ctx, budgetOpts
+        );
+
+        // Start the budget clock for ACTIVE goals
+        const budget = new BudgetTracker(budgetOpts);
+        if (state === 'ACTIVE') {
+          budget.startActiveClock();
+        }
+
+        // Inject the appropriate prompt
         if (ctx.sessionKey) {
+          const prompt = mode === 'spec'
+            ? renderSpecCoachPrompt(goal, runDir)
+            : renderGoalLoopPrompt(goal, runDir);
+
           await api.enqueueNextTurnInjection({
             sessionKey: ctx.sessionKey,
-            placement: "prepend_context",
+            placement: 'prepend_context',
             ttlMs: 10 * 60 * 1000,
             idempotencyKey: `goal-start:${runId}`,
-            text: mode === "spec" ? specCoachPrompt(goal, runDir) : goalLoopPrompt(goal, runDir),
+            text: prompt,
             metadata: { runId, runDir, mode },
           });
         }
+
+        const stateLabel = state === 'SPEC_COACH' ? 'SPEC_COACH (abstract goal)' : 'ACTIVE (concrete goal)';
         return {
-          text: `Goal Mode gestartet: ${runId}\nState: ${state}\nRun: ${runDir}`,
+          text: `Goal started: ${runId}\nState: ${stateLabel}\nMode: ${mode}\nRun: ${runDir}\nBudget: ${budget.getDisplay()}`,
           continueAgent: true,
         };
       },
